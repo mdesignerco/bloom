@@ -824,62 +824,53 @@ function App() {
 						});
 						localStorage.setItem("bloom-first-run", "done");
 					}
-					const rawDockMode = getVal("bloom-dock-mode", "fixed") as string;
-					const dockMode = rawDockMode === "auto-hide" ? "smart" : rawDockMode;
+
+					// Island-only build: the Bloom Dock (taskbar replacement) is
+					// disabled. Only the notch/island appbar is synced and the
+					// native Windows taskbar is never hidden.
 					const syncWindows = async () => {
-						const dockEnabled = getVal("bloom-dock-enabled", "true") === "true";
-						if (dockEnabled) {
-							await invoke("init_dock", { mode: dockMode });
-						}
 						await invoke("change_notch_mode", { mode: nMode });
 						await invoke("sync_appbar");
 					};
 
-					const dockEnabled = getVal("bloom-dock-enabled", "true") === "true";
-					const runDockInit = () => {
-						// 1. Snappy initial sync
+					const runIslandInit = () => {
 						setTimeout(syncWindows, 400);
-						// 2. Safety-net dock retry
-						if (dockEnabled) {
-							setTimeout(() => invoke("init_dock", { mode: dockMode }).catch(() => {}), 1500);
-						}
-						// 3. Layout corrections
 						setTimeout(() => invoke("sync_appbar"), 1000);
 						setTimeout(() => invoke("sync_appbar"), 2500);
 						setTimeout(() => invoke("sync_appbar"), 5000);
 					};
 
-					// Mirror Overlay.tsx's splash decision for dock init too — only wait when
-					// a splash is actually coming, otherwise init immediately.
-					const runDockInitAfterSplash = () => {
-						let dockStarted = false;
-						const unlistenDock = listen("splash-done", () => {
-							if (dockStarted) return;
-							dockStarted = true;
-							runDockInit();
-							unlistenDock.then((fn) => fn());
+					// Mirror Overlay.tsx's splash decision: only wait when a splash
+					// is actually coming, otherwise init immediately.
+					const runIslandInitAfterSplash = () => {
+						let started = false;
+						const unlisten = listen("splash-done", () => {
+							if (started) return;
+							started = true;
+							runIslandInit();
+							unlisten.then((fn) => fn());
 						});
 						setTimeout(() => {
-							if (dockStarted) return;
-							dockStarted = true;
-							runDockInit();
-							unlistenDock.then((fn) => fn());
+							if (started) return;
+							started = true;
+							runIslandInit();
+							unlisten.then((fn) => fn());
 						}, 6000);
 					};
 
 					const storedVersion = localStorage.getItem("bloom-app-version");
 					if (firstRun || storedVersion === null) {
-						runDockInitAfterSplash();
+						runIslandInitAfterSplash();
 					} else {
 						getVersion()
 							.then((currentVersion) => {
 								if (storedVersion !== currentVersion) {
-									runDockInitAfterSplash();
+									runIslandInitAfterSplash();
 								} else {
-									runDockInit();
+									runIslandInit();
 								}
 							})
-							.catch(() => runDockInit());
+							.catch(() => runIslandInit());
 					}
 				}
 

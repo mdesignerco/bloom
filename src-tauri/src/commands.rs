@@ -4,8 +4,7 @@ use windows::Win32::Foundation::{HWND, LPARAM};
 use windows::Win32::UI::WindowsAndMessaging::EnumWindows;
 
 use crate::services::{
-    enum_windows_proc, register_appbar, register_dock_appbar, sync_overlays,
-    unregister_appbar_native,
+    enum_windows_proc, register_appbar, sync_overlays, unregister_appbar_native,
 };
 use crate::state::*;
 use crate::types::{AppInfo, BrightnessChangeEvent, IntRect};
@@ -68,137 +67,36 @@ pub fn set_ignore_cursor_events(window: Window, ignore: bool) {
 
 #[tauri::command]
 pub async fn init_dock(app: AppHandle, mode: String) {
-    // Backend guard: bail if dock is disabled in settings.
-    // The frontend already checks this, but settings.json may have a stale
-    // value if the write didn't complete before restart. Reading here too
-    // makes the dock reliably stay hidden regardless of frontend timing.
-    let enabled = get_setting_str(&app, "bloom-dock-enabled").unwrap_or_else(|| "true".to_string());
-    if enabled != "true" {
-        if let Some(dock_win) = app.get_webview_window("dock") {
-            let _ = dock_win.hide();
-            DOCK_APPBAR_REGISTERED.store(false, Ordering::Relaxed);
-        }
-        return;
-    }
-
+    // Island-only build: the Bloom Dock (taskbar replacement) is intentionally
+    // disabled. The dock window is never shown and the native Windows taskbar is
+    // never hidden, regardless of any saved setting.
+    let _ = mode;
     if let Some(dock_win) = app.get_webview_window("dock") {
-        // 1. Always show first — idempotent, required before any positioning
-        let _ = dock_win.show();
-        if let Ok(hwnd) = dock_win.hwnd() {
-            re_assert_topmost(hwnd);
-        }
-
-        // 2. Register as appbar (fixed) or manually position (auto-hide)
-        if mode == "fixed" {
-            // register_dock_appbar calls show() internally too, and handles retries
-            register_dock_appbar(dock_win.clone());
-        } else {
-            // Auto-hide mode: position at bottom of screen.
-            // Retry until primary_monitor() is available (can fail on autostart before shell).
-            let dock_clone = dock_win.clone();
-            tauri::async_runtime::spawn(async move {
-                for attempt in 0..20 {
-                    // Wait for monitor and window dimensions to be available.
-                    // Never use a hardcoded fallback — wrong values produce off-screen placement.
-                    // Extract HWND as isize before any await (raw pointer is not Send).
-                    let hwnd_val = dock_clone.hwnd().map(|h| h.0 as isize).unwrap_or(0);
-                    let ph = dock_clone
-                        .outer_size()
-                        .map(|s| s.height as i32)
-                        .unwrap_or(0);
-                    let monitor_info = dock_clone.primary_monitor().ok().flatten().map(|m| {
-                        let s = m.size();
-                        let p = m.position();
-                        (
-                            tauri::PhysicalSize::new(s.width, s.height),
-                            tauri::PhysicalPosition::new(p.x, p.y),
-                        )
-                    });
-
-                    if hwnd_val != 0 {
-                        if let Some((m_size, m_pos)) = monitor_info {
-                            if ph <= 10 {
-                                // outer_size() not ready yet — retry next tick
-                                if attempt < 19 {
-                                    tokio::time::sleep(tokio::time::Duration::from_millis(200))
-                                        .await;
-                                }
-                                continue;
-                            }
-                            let final_y = m_pos.y + m_size.height as i32 - ph;
-                            unsafe {
-                                use windows::Win32::Foundation::HWND;
-                                use windows::Win32::UI::WindowsAndMessaging::{
-                                    SetWindowPos, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOZORDER,
-                                };
-                                let _ = SetWindowPos(
-                                    HWND(hwnd_val as *mut _),
-                                    None,
-                                    m_pos.x,
-                                    final_y,
-                                    m_size.width as i32,
-                                    ph,
-                                    SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
-                                );
-                            }
-                            // Re-assert topmost after repositioning
-                            if let Ok(hwnd) = dock_clone.hwnd() {
-                                re_assert_topmost(hwnd);
-                            }
-                            // Ensure visible after positioning
-                            let _ = dock_clone.show();
-                            break;
-                        }
-                    }
-                    if attempt < 19 {
-                        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-                    }
-                }
-            });
-        }
-
-        // 3. Hide taskbar after showing dock (not before, so user always has something)
-        set_taskbar_visibility(false, false);
-        NATIVE_TASKBAR_HIDDEN.store(true, Ordering::Relaxed);
-
-        // 4. Reset overlap state so the overlap thread re-syncs cleanly
-        CURRENT_DOCK_OVERLAP.store(0, Ordering::Relaxed);
-        let _ = app.emit("dock-overlap", false);
-        // Sync the adaptive-dock signal so the dock expands immediately if a
-        // maximized window is already in the foreground when it's enabled.
-        let _ = app.emit(
-            "dock-maximized",
-            CURRENT_FOREGROUND_MAXIMIZED.load(Ordering::Relaxed),
-        );
+        let _ = dock_win.hide();
+    }
+    DOCK_APPBAR_REGISTERED.store(false, Ordering::Relaxed);
+    if NATIVE_TASKBAR_HIDDEN.load(Ordering::Relaxed) {
+        set_taskbar_visibility(true, true);
+        NATIVE_TASKBAR_HIDDEN.store(false, Ordering::Relaxed);
     }
 }
 
 #[tauri::command]
 pub async fn toggle_dock(app: AppHandle, enable: bool) {
+    // Island-only build: the dock is always disabled. The native taskbar is
+    // never hidden.
+    let _ = enable;
     if let Some(dock_win) = app.get_webview_window("dock") {
-        if enable {
-            // Load the saved dock mode rather than hardcoding "fixed"
-            let saved_mode = crate::utils::get_setting_str(&app, "bloom-dock-mode")
-                .unwrap_or_else(|| "fixed".to_string());
-            init_dock(app, saved_mode).await;
-        } else {
-            let _ = dock_win.hide();
-            if let Ok(hwnd) = dock_win.hwnd() {
-                let hwnd_val = hwnd.0 as isize;
-                tauri::async_runtime::spawn_blocking(move || {
-                    unregister_appbar_native(HWND(hwnd_val as *mut _));
-                });
-            }
-            DOCK_APPBAR_REGISTERED.store(false, Ordering::Relaxed);
-            set_taskbar_visibility(true, true);
-            NATIVE_TASKBAR_HIDDEN.store(false, Ordering::Relaxed);
-
-            // Re-sync other appbars
-            if let Some(main_win) = app.get_webview_window("main") {
-                if MAIN_APPBAR_REGISTERED.load(Ordering::Relaxed) {
-                    register_appbar(main_win);
-                }
-            }
+        let _ = dock_win.hide();
+    }
+    DOCK_APPBAR_REGISTERED.store(false, Ordering::Relaxed);
+    if NATIVE_TASKBAR_HIDDEN.load(Ordering::Relaxed) {
+        set_taskbar_visibility(true, true);
+        NATIVE_TASKBAR_HIDDEN.store(false, Ordering::Relaxed);
+    }
+    if let Some(main_win) = app.get_webview_window("main") {
+        if MAIN_APPBAR_REGISTERED.load(Ordering::Relaxed) {
+            register_appbar(main_win);
         }
     }
 }
@@ -214,120 +112,21 @@ pub async fn sync_appbar(app: AppHandle) {
             }
         }
     }
-    if let Some(dock_win) = app.get_webview_window("dock") {
-        // Skip dock re-registration if dock is disabled in settings.
-        let dock_enabled =
-            get_setting_str(&app, "bloom-dock-enabled").unwrap_or_else(|| "true".to_string());
-        if dock_enabled == "true" && DOCK_APPBAR_REGISTERED.load(Ordering::Relaxed) {
-            register_dock_appbar(dock_win);
-        } else {
-            if let Ok(hwnd) = dock_win.hwnd() {
-                re_assert_topmost(hwnd);
-            }
-        }
-    }
     sync_overlays(&app);
 }
 
 #[tauri::command]
 pub async fn change_dock_mode(app: AppHandle, mode: String) {
+    // Island-only build: no-op. The dock is never shown and the native taskbar
+    // is never hidden.
+    let _ = mode;
     if let Some(dock_win) = app.get_webview_window("dock") {
-        if mode == "fixed" {
-            register_dock_appbar(dock_win.clone());
-        } else {
-            let _ = dock_win.show();
-            if let Ok(hwnd) = dock_win.hwnd() {
-                let hwnd_val = hwnd.0 as isize;
-                tauri::async_runtime::spawn_blocking(move || {
-                    unregister_appbar_native(HWND(hwnd_val as *mut _));
-                });
-                DOCK_APPBAR_REGISTERED.store(false, Ordering::Relaxed);
-
-                // Retry primary_monitor() — can fail on autostart before shell initializes
-                let dock_clone = dock_win.clone();
-                tauri::async_runtime::spawn(async move {
-                    for attempt in 0..10 {
-                        // Never fall back to a hardcoded pixel height.
-                        // Extract HWND as isize before any await (raw pointer is not Send).
-                        let hwnd_val = dock_clone.hwnd().map(|h| h.0 as isize).unwrap_or(0);
-                        let ph = dock_clone
-                            .outer_size()
-                            .map(|s| s.height as i32)
-                            .unwrap_or(0);
-                        let monitor_info = dock_clone.primary_monitor().ok().flatten().map(|m| {
-                            let s = m.size();
-                            let p = m.position();
-                            (
-                                tauri::PhysicalSize::new(s.width, s.height),
-                                tauri::PhysicalPosition::new(p.x, p.y),
-                            )
-                        });
-
-                        if hwnd_val != 0 {
-                            if let Some((m_size, m_pos)) = monitor_info {
-                                if ph <= 10 {
-                                    if attempt < 9 {
-                                        tokio::time::sleep(tokio::time::Duration::from_millis(300))
-                                            .await;
-                                    }
-                                    continue;
-                                }
-                                let final_y = m_pos.y + m_size.height as i32 - ph;
-                                unsafe {
-                                    use windows::Win32::Foundation::HWND;
-                                    use windows::Win32::UI::WindowsAndMessaging::{
-                                        SetWindowPos, SWP_FRAMECHANGED, SWP_NOACTIVATE,
-                                        SWP_NOZORDER,
-                                    };
-                                    let _ = SetWindowPos(
-                                        HWND(hwnd_val as *mut _),
-                                        None,
-                                        m_pos.x,
-                                        final_y,
-                                        m_size.width as i32,
-                                        ph,
-                                        SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
-                                    );
-                                }
-                                if let Ok(hwnd) = dock_clone.hwnd() {
-                                    re_assert_topmost(hwnd);
-                                }
-                                break;
-                            }
-                        }
-                        if attempt < 9 {
-                            tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
-                        }
-                    }
-                });
-            }
-        }
-
-        // Ensure always on top and native taskbar stays hidden
-        if let Ok(hwnd) = dock_win.hwnd() {
-            re_assert_topmost(hwnd);
-        }
-        set_taskbar_visibility(false, false);
-        NATIVE_TASKBAR_HIDDEN.store(true, Ordering::Relaxed);
-
-        // Sync the current overlap state immediately to the frontend
-        let current = CURRENT_DOCK_OVERLAP.load(Ordering::Relaxed);
-        if current != -1 {
-            let _ = app.emit("dock-overlap", current == 1);
-        }
-        let _ = app.emit(
-            "dock-maximized",
-            CURRENT_FOREGROUND_MAXIMIZED.load(Ordering::Relaxed),
-        );
-
-        // Double sync after a short delay to catch any layout changes
-        let dock_clone = dock_win.clone();
-        tauri::async_runtime::spawn(async move {
-            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-            if DOCK_APPBAR_REGISTERED.load(Ordering::Relaxed) {
-                register_dock_appbar(dock_clone);
-            }
-        });
+        let _ = dock_win.hide();
+    }
+    DOCK_APPBAR_REGISTERED.store(false, Ordering::Relaxed);
+    if NATIVE_TASKBAR_HIDDEN.load(Ordering::Relaxed) {
+        set_taskbar_visibility(true, true);
+        NATIVE_TASKBAR_HIDDEN.store(false, Ordering::Relaxed);
     }
 }
 
@@ -2162,22 +1961,8 @@ pub fn open_system_tray() {
                 }
             });
         } else {
-            // If already toggled on manually, toggle off
-            crate::utils::set_taskbar_visibility(false, false);
-            crate::state::NATIVE_TASKBAR_HIDDEN.store(true, Ordering::Relaxed);
-
-            let exstyle = GetWindowLongA(hwnd, GWL_EXSTYLE);
-            let _ = SetLayeredWindowAttributes(
-                hwnd,
-                windows::Win32::Foundation::COLORREF(0),
-                255,
-                LWA_ALPHA,
-            );
-            let _ = SetWindowLongA(
-                hwnd,
-                GWL_EXSTYLE,
-                exstyle & !(WS_EX_LAYERED.0 as i32) & !(WS_EX_TRANSPARENT.0 as i32),
-            );
+            // Island-only build: the native taskbar is always visible, so the
+            // system tray is already accessible — nothing to do here.
         }
     });
 }
@@ -2396,15 +2181,6 @@ fn re_register_appbars(app: &AppHandle, settings: &HashMap<String, serde_json::V
             .unwrap_or(true);
         if notch_fixed {
             crate::services::register_appbar(main_win);
-        }
-    }
-    if let Some(dock_win) = app.get_webview_window("dock") {
-        let is_fixed = settings
-            .get("bloom-dock-mode")
-            .map(|v| v.as_str() == Some("fixed"))
-            .unwrap_or(false);
-        if is_fixed {
-            crate::services::register_dock_appbar(dock_win);
         }
     }
 }

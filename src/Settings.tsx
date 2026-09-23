@@ -3,13 +3,12 @@ import { createRoot } from "react-dom/client";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { Effect } from "@tauri-apps/api/window";
 import { invoke } from "@tauri-apps/api/core";
-import { X, Settings, Palette, PanelTop, Monitor, Layers, Info } from "lucide-react";
+import { X, Settings, Palette, PanelTop, Layers, Info } from "lucide-react";
 import {
 	useSettings,
 	GeneralTab,
 	AppearanceTab,
 	NotchTab,
-	DockTab,
 	OverlaysTab,
 	AboutTab
 } from "./settings/index";
@@ -23,7 +22,6 @@ const TABS: { id: SettingsTab; label: string; icon: typeof Settings }[] = [
 	{ id: "general", label: "General", icon: Settings },
 	{ id: "appearance", label: "Appearance", icon: Palette },
 	{ id: "notch", label: "Notch", icon: PanelTop },
-	{ id: "dock", label: "Dock", icon: Monitor },
 	{ id: "overlays", label: "Overlays", icon: Layers },
 	{ id: "about", label: "About", icon: Info }
 ];
@@ -158,22 +156,6 @@ function SettingsApp() {
 							handleCityClear={settings.handleCityClear}
 							statusWidgets={settings.statusWidgets}
 							handleWidgetsChange={settings.handleWidgetsChange}
-						/>
-					)}
-					{activeTab === "dock" && (
-						<DockTab
-							dockEnabled={settings.dockEnabled}
-							toggleDock={settings.toggleDock}
-							dockMode={settings.dockMode}
-							setDockModeValue={settings.setDockModeValue}
-							dockPreviewEnabled={settings.dockPreviewEnabled}
-							toggleDockPreview={settings.toggleDockPreview}
-							dockIconOnly={settings.dockIconOnly}
-							toggleDockIconOnly={settings.toggleDockIconOnly}
-							dockAdaptive={settings.dockAdaptive}
-							toggleDockAdaptive={settings.toggleDockAdaptive}
-							dockWinNumberEnabled={settings.dockWinNumberEnabled}
-							toggleDockWinNumber={settings.toggleDockWinNumber}
 						/>
 					)}
 					{activeTab === "overlays" && (

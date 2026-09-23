@@ -180,9 +180,9 @@ fn main() {
             }
 
             let window = app.get_webview_window("main").unwrap();
-            let dock_win = app.get_webview_window("dock").unwrap();
 
-            // Sync window rects initially and on event
+            // Island-only build: the Bloom Dock window no longer exists. Only the
+            // main (notch/island) window rect is tracked.
             let win_clone = window.clone();
             let update_main_rect = move || {
                 if let (Ok(p), Ok(s)) = (win_clone.outer_position(), win_clone.outer_size()) {
@@ -192,17 +192,7 @@ fn main() {
                 }
             };
 
-            let dock_clone = dock_win.clone();
-            let update_dock_window_rect = move || {
-                if let (Ok(p), Ok(s)) = (dock_clone.outer_position(), dock_clone.outer_size()) {
-                    if let Ok(mut lock) = DOCK_WINDOW_RECT.lock() {
-                        *lock = Some((p, s));
-                    }
-                }
-            };
-
             update_main_rect();
-            update_dock_window_rect();
 
             let u_main = update_main_rect.clone();
             let win_for_events = window.clone();
@@ -224,34 +214,6 @@ fn main() {
                 tauri::WindowEvent::CloseRequested { api, .. } => {
                     api.prevent_close();
                     restore_taskbar_and_exit(&handle_for_events);
-                }
-                _ => {}
-            });
-
-            let u_dock = update_dock_window_rect.clone();
-            let dock_for_events = dock_win.clone();
-            let handle_for_dock_events = app.handle().clone();
-            dock_win.on_window_event(move |e| match e {
-                tauri::WindowEvent::Moved(_) | tauri::WindowEvent::Resized(_) => {
-                    u_dock();
-                    sync_overlays(&handle_for_dock_events);
-                }
-                tauri::WindowEvent::ScaleFactorChanged { .. } => {
-                    let h = handle_for_dock_events.clone();
-                    if DOCK_APPBAR_REGISTERED.load(Ordering::Relaxed) {
-                        let w = dock_for_events.clone();
-                        tauri::async_runtime::spawn(async move {
-                            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                            register_dock_appbar(w);
-                            sync_overlays(&h);
-                        });
-                    } else {
-                        sync_overlays(&h);
-                    }
-                }
-                tauri::WindowEvent::CloseRequested { api, .. } => {
-                    api.prevent_close();
-                    restore_taskbar_and_exit(&handle_for_dock_events);
                 }
                 _ => {}
             });
