@@ -2770,6 +2770,14 @@ pub fn position_main_window(app: &AppHandle, animate: bool) {
     let size = monitor.size();
     let target = (pos.x, pos.y, size.width, ph);
 
+    // Fixed/overlay mode must make the island visible: the main window starts
+    // hidden (visible:false) and position_main_window is the single choke point
+    // for all fixed-mode placement paths (startup, sync_appbar, mode change,
+    // monitor-follow). Without this it only reappears after a smart/fixed toggle.
+    if !main_win.is_visible().unwrap_or(false) {
+        let _ = main_win.show();
+    }
+
     if animate {
         slide_window_to(&main_win, target);
     } else {
