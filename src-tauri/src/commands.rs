@@ -2759,7 +2759,7 @@ pub fn import_settings(app: AppHandle, settings: String) -> Result<(), String> {
         );
     }
 
-    if imported.get("bloom-scale").is_some() {
+    if imported.contains_key("bloom-scale") {
         re_register_appbars(&app, &imported);
     }
 
@@ -2819,8 +2819,10 @@ pub fn setup_settings_watcher(app: AppHandle) {
 
             let mut notify_buffer = [0u8; 4096];
             let mut bytes_returned = 0u32;
-            let mut overlapped = OVERLAPPED::default();
-            overlapped.hEvent = h_event;
+            let mut overlapped = OVERLAPPED {
+                hEvent: h_event,
+                ..Default::default()
+            };
 
             loop {
                 let success = ReadDirectoryChangesW(

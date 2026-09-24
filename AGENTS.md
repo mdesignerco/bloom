@@ -1,0 +1,49 @@
+# AGENTS.md
+
+Guía para agentes que trabajan en esta base de código (Tauri 2 + React + Vite).
+
+## Build y verificación
+
+- **Build release correcto (raíz del repo):**
+  ```
+  bun tauri build --no-bundle
+  ```
+  Usa `--no-bundle` para el binario de desarrollo/verificación rápida; emite un
+  `.exe` "desnudo" que no instala ni reinicia el equipo.
+
+- **NUNCA compiles con `cargo build --release` plano para probar.** El crate de
+  Tauri no activa el protocolo `custom-protocol` salvo que el build pase por
+  `tauri build`; un binario plano intentará cargar `http://localhost:1420` y
+  fallará con `ERR_CONNECTION_REFUSED` (ventana en blanco).
+
+- **Verificación en orden** (todo desde la raíz del repo):
+  ```
+  bun run build          # tsc && vite build (frontend)
+  cargo clippy --release # backend: no warnings nuevos
+  cargo test --release --bin bloom --manifest-path src-tauri/Cargo.toml
+  ```
+
+- **Formato:** `bun run format` (oxfmt para frontend + `cargo fmt` para backend).
+
+## Comandos útiles
+
+| Comando                     | Qué hace                                   |
+| --------------------------- | ------------------------------------------ |
+| `bun run dev`               | Vite dev server                            |
+| `bun run tauri dev`         | App en modo desarrollo                     |
+| `bun run bump`              | Incrementa versión (`scripts/bump-version.mjs`) |
+| `bun run release`           | Release completo (`scripts/release.mjs`)   |
+
+## Gotchas específicos
+
+- **`get_now_ms()`** (`src-tauri/src/utils.rs`) usa un `Instant` monotónico
+  estático con `OnceLock` (inmune a cambios de reloj de pared). No vuelvas a
+  `SystemTime` ni definas relojes locales duplicados.
+- **La isla (línea) sobre el monitor** mide `NOTCH_HEIGHT_CSS_PX` (420 CSS px)
+  escalado por `get_bloom_scale` y el factor DPI del monitor. Cambios de
+  posicionamiento pasan por `reposition_island_and_overlays` en `services.rs`.
+- **Fade de ventanas** se hace vía Win32 (`SetLayeredWindowAttributes` +
+  `WS_EX_LAYERED`) porque Tauri 2.11 no expone `set_opacity`; ver
+  `set_window_opacity` en `src-tauri/src/services.rs`.
+- **Windows/resolución de monitores**: la app es Windows-only (imports Win32 en
+  backend). No añadas código de macOS/Linux en rutas críticas.

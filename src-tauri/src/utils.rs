@@ -950,6 +950,37 @@ pub fn capture_hwnd_to_base64(hwnd: HWND, max_width: u32, max_height: u32) -> Op
 #[cfg(test)]
 mod tests {
     use super::expand_env_vars;
+    use super::get_now_ms;
+
+    #[test]
+    fn get_now_ms_is_positive() {
+        assert!(get_now_ms() >= 0);
+    }
+
+    #[test]
+    fn get_now_ms_is_monotonic() {
+        let a = get_now_ms();
+        let b = get_now_ms();
+        assert!(b >= a);
+    }
+
+    #[test]
+    fn get_now_ms_advances_with_real_time() {
+        let start = get_now_ms();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let end = get_now_ms();
+        assert!(end > start);
+        assert!(end - start >= 10);
+    }
+
+    #[test]
+    fn get_now_ms_is_stable_across_calls() {
+        // Reads without an intervening sleep must not move backwards.
+        let a = get_now_ms();
+        let b = get_now_ms();
+        let c = get_now_ms();
+        assert!(a <= b && b <= c);
+    }
 
     #[test]
     fn env_expansion() {

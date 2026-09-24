@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::sync::mpsc::{channel, Sender};
 use std::sync::{
-    atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU8, Ordering},
+    atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU8, AtomicUsize, Ordering},
     Mutex, OnceLock,
 };
 use std::time::{Duration, Instant};
@@ -856,12 +856,10 @@ pub fn setup_audio_visualization(app_handle: AppHandle) {
                                         {
                                             let mut total_mag = 0.0f32;
                                             let mut count = 0u32;
-                                            for bin in bin_start..bin_end {
-                                                if bin >= FFT_SIZE / 2 {
-                                                    break;
-                                                }
-                                                let mag = fft_input[bin].norm();
-                                                total_mag += mag;
+                                            for entry in
+                                                &fft_input[bin_start..bin_end.min(FFT_SIZE / 2)]
+                                            {
+                                                total_mag += entry.norm();
                                                 count += 1;
                                             }
                                             let avg_mag = total_mag / count.max(1) as f32;
@@ -1820,7 +1818,7 @@ pub fn setup_brightness_worker() {
         let locator: IWbemLocator = match CoCreateInstance(&WbemLocator, None, CLSCTX_ALL) {
             Ok(l) => l,
             Err(_) => {
-                let _ = CoUninitialize();
+                CoUninitialize();
                 return;
             }
         };
@@ -1837,7 +1835,7 @@ pub fn setup_brightness_worker() {
         ) {
             Ok(s) => s,
             Err(_) => {
-                let _ = CoUninitialize();
+                CoUninitialize();
                 return;
             }
         };
@@ -1918,7 +1916,7 @@ pub fn setup_brightness_worker() {
             // 2. Desktop external monitor via Physical Monitor API (DXVA2 DDC/CI)
             set_physical_monitors_brightness(brightness);
         }
-        let _ = CoUninitialize();
+        CoUninitialize();
     });
 }
 
@@ -2098,7 +2096,7 @@ unsafe extern "system" fn mouse_hook_proc(
             // Refresh cached monitor info every 500ms, tracking the active monitor
             // (foreground window, else cursor) so edge hit-boxes follow the island.
             if now - MH_LAST_MONITOR_UPDATE_MS.load(Ordering::Relaxed) > 500 {
-                if let Some(monitor) = crate::utils::active_monitor(&app_handle) {
+                if let Some(monitor) = crate::utils::active_monitor(app_handle) {
                     let pos = monitor.position();
                     let size = monitor.size();
                     *MH_CACHED_MON_POS.lock().unwrap() = Some((pos.x, pos.y));
@@ -2779,6 +2777,20 @@ pub fn reposition_island_and_overlays(app: &AppHandle, animate: bool) {
     }
 }
 
+/// Height of the island window in CSS px. This is the webview height the notch
+/// content is designed for; it is scaled by bloom-scale and the monitor DPI to
+/// get physical pixels.
+const NOTCH_HEIGHT_CSS_PX: f64 = 420.0;
+
+/// Animation steps per vertical slide and the per-step delay. A run is
+/// `ANIM_STEPS * ANIM_STEP_MS` (10 × 20 ms = 200 ms) and reads as smooth ease-out.
+const ANIM_STEPS: usize = 10;
+const ANIM_STEP_MS: u64 = 20;
+
+/// Bumped on every animation request so a superseded run aborts before it snaps
+/// to a stale monitor (covers rapid double monitor switches).
+static ANIMATION_EPOCH: AtomicUsize = AtomicUsize::new(0);
+
 /// Position the island (main window) to span the monitor's full width and the
 /// notch height (420 CSS px × scale). The window is shown before placing: it
 /// starts hidden (visible:false) and this is the single placement choke point
@@ -2788,11 +2800,13 @@ fn place_island(main_win: &tauri::WebviewWindow, monitor: &tauri::Monitor, anima
     let scale = monitor.scale_factor();
     let app = main_win.app_handle();
     let bloom_scale = crate::utils::get_bloom_scale(app);
-    let ph = ((420.0 * bloom_scale) * scale) as u32;
+    let ph = (NOTCH_HEIGHT_CSS_PX * bloom_scale * scale) as u32;
     let pos = monitor.position();
     let size = monitor.size();
     let target = (pos.x, pos.y, size.width, ph);
 
+    // The main window starts hidden (visible:false); make sure it is up before
+    // any placement so fixed/overlay mode appears at boot.
     if !main_win.is_visible().unwrap_or(false) {
         let _ = main_win.show();
     }
@@ -2802,18 +2816,30 @@ fn place_island(main_win: &tauri::WebviewWindow, monitor: &tauri::Monitor, anima
     } else {
         // Restore opacity in case an interrupted cross-monitor animation left
         // the window transparent.
-        if let Ok(hwnd) = main_win.hwnd() {
-            set_window_opacity(hwnd, 1.0);
-        }
-        let _ = main_win.set_position(tauri::PhysicalPosition::new(pos.x, pos.y));
-        let _ = main_win.set_size(tauri::PhysicalSize::new(size.width, ph));
+        snap_to(main_win, target);
     }
 }
 
+/// Instantly park the window at `(x, y)` with size `(w, h)` at full opacity
+/// (no layered style changes).
+fn snap_to(win: &tauri::WebviewWindow, target: (i32, i32, u32, u32)) {
+    let (x, y, w, h) = target;
+    if let Ok(hwnd) = win.hwnd() {
+        set_window_opacity(hwnd, 1.0);
+    }
+    let _ = win.set_position(tauri::PhysicalPosition::new(x, y));
+    let _ = win.set_size(tauri::PhysicalSize::new(w, h));
+}
+
 /// Set a window's top-level opacity via the layered-window attribute. Tauri
-/// v2.11 does not expose an opacity setter, so it is done directly with Win32;
-/// the layered style is added on demand and keeps WS_EX_TOOLWINDOW/topmost.
+/// v2.11 does not expose an opacity setter, so it is done directly with Win32.
+/// The layered style is added on demand and intentionally not removed on
+/// fade-out: dropping WS_EX_LAYERED can cause a one-frame flash of the window
+/// background, and the next fade re-adds it anyway.
 fn set_window_opacity(hwnd: HWND, opacity: f64) {
+    if hwnd.is_invalid() {
+        return;
+    }
     let alpha = (opacity.clamp(0.0, 1.0) * 255.0).round() as u8;
     let ex_style = unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) };
     if ex_style & WS_EX_LAYERED.0 as isize == 0 {
@@ -2824,9 +2850,9 @@ fn set_window_opacity(hwnd: HWND, opacity: f64) {
     let _ = unsafe { SetLayeredWindowAttributes(hwnd, COLORREF(0), alpha, LWA_ALPHA) };
 }
 
-/// Slide `win` from (fx, fy) to (tx, ty) in small ease-out steps (~20 ms each),
+/// Slide `win` from (fx, fy) to (tx, ty) in `ANIM_STEPS` ease-out steps,
 /// cross-fading the whole window between `fade_from` and `fade_to` opacity.
-fn animate_xy(
+async fn animate_xy(
     win: &tauri::WebviewWindow,
     fx: i32,
     fy: i32,
@@ -2835,57 +2861,48 @@ fn animate_xy(
     fade_from: f64,
     fade_to: f64,
 ) {
-    let win2 = win.clone();
-    tauri::async_runtime::spawn(async move {
-        const STEPS: usize = 10;
-        for i in 1..=STEPS {
-            let t = i as f64 / STEPS as f64;
-            let eased = 1.0 - (1.0 - t) * (1.0 - t); // ease-out
-            let x = (fx as f64 + (tx as f64 - fx as f64) * eased).round() as i32;
-            let y = (fy as f64 + (ty as f64 - fy as f64) * eased).round() as i32;
-            let op = fade_from + (fade_to - fade_from) * eased;
-            let _ = win2.set_position(tauri::PhysicalPosition::new(x, y));
-            if let Ok(hwnd) = win2.hwnd() {
-                set_window_opacity(hwnd, op);
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    for i in 1..=ANIM_STEPS {
+        let t = i as f64 / ANIM_STEPS as f64;
+        let eased = 1.0 - (1.0 - t) * (1.0 - t); // ease-out
+        let x = (fx as f64 + (tx as f64 - fx as f64) * eased).round() as i32;
+        let y = (fy as f64 + (ty as f64 - fy as f64) * eased).round() as i32;
+        let op = fade_from + (fade_to - fade_from) * eased;
+        let _ = win.set_position(tauri::PhysicalPosition::new(x, y));
+        if let Ok(hwnd) = win.hwnd() {
+            set_window_opacity(hwnd, op);
         }
-    });
+        tokio::time::sleep(std::time::Duration::from_millis(ANIM_STEP_MS)).await;
+    }
 }
 
-/// Cross-monitor move: slide up off the current monitor fading out, snap
-/// (invisible) above the target monitor and slide down into place fading in.
+/// Cross-monitor move, driven by a single sequential task: slide up off the
+/// current monitor fading out, snap (invisible) above the target monitor, then
+/// slide down into place fading in. Same-monitor moves snap without animating.
 fn animate_island_to_monitor(win: &tauri::WebviewWindow, target: (i32, i32, u32, u32)) {
-    let Ok(from_pos) = win.outer_position() else {
-        let (x, y, w, h) = target;
-        if let Ok(hwnd) = win.hwnd() {
-            set_window_opacity(hwnd, 1.0);
-        }
-        let _ = win.set_position(tauri::PhysicalPosition::new(x, y));
-        let _ = win.set_size(tauri::PhysicalSize::new(w, h));
-        return;
-    };
-    let (tx, ty, tw, th) = target;
-    if (from_pos.x - tx).abs() < 1 && (from_pos.y - ty).abs() < 1 {
-        if let Ok(hwnd) = win.hwnd() {
-            set_window_opacity(hwnd, 1.0);
-        }
-        let _ = win.set_position(tauri::PhysicalPosition::new(tx, ty));
-        let _ = win.set_size(tauri::PhysicalSize::new(tw, th));
-        return;
-    }
-    // Slide up out of view on the old monitor, fading out as it goes.
-    let above_old_y = from_pos.y - th as i32;
-    animate_xy(win, from_pos.x, from_pos.y, from_pos.x, above_old_y, 1.0, 0.0);
+    let epoch = ANIMATION_EPOCH.fetch_add(1, Ordering::Relaxed) + 1;
     let win2 = win.clone();
     tauri::async_runtime::spawn(async move {
-        // Let the exit run finish before touching the window.
-        tokio::time::sleep(std::time::Duration::from_millis(240)).await;
-        // Snap out of view just above the new monitor and slide down into place,
-        // fading back in.
+        let Ok(from_pos) = win2.outer_position() else {
+            snap_to(&win2, target);
+            return;
+        };
+        let (tx, ty, tw, th) = target;
+        if (from_pos.x - tx).abs() < 1 && (from_pos.y - ty).abs() < 1 {
+            snap_to(&win2, target);
+            return;
+        }
+        // Phase 1: slide up out of view on the old monitor, fading out.
+        let above_old_y = from_pos.y - th as i32;
+        animate_xy(&win2, from_pos.x, from_pos.y, from_pos.x, above_old_y, 1.0, 0.0).await;
+        // A newer animation superseded this one (rapid monitor switch); let the
+        // new run take over from the current state instead of snapping stale.
+        if ANIMATION_EPOCH.load(Ordering::Relaxed) != epoch {
+            return;
+        }
+        // Snap out of view just above the new monitor, then slide into place.
         let _ = win2.set_position(tauri::PhysicalPosition::new(tx, ty - th as i32));
         let _ = win2.set_size(tauri::PhysicalSize::new(tw, th));
-        animate_xy(&win2, tx, ty - th as i32, tx, ty, 0.0, 1.0);
+        animate_xy(&win2, tx, ty - th as i32, tx, ty, 0.0, 1.0).await;
     });
 }
 
@@ -3184,7 +3201,7 @@ pub unsafe extern "system" fn enum_windows_proc(hwnd: HWND, lparam: LPARAM) -> B
                     let is_browser_pwa = is_browser_host
                         && window_aumid
                             .as_deref()
-                            .map_or(false, crate::commands::is_browser_pwa_aumid);
+                            .is_some_and(crate::commands::is_browser_pwa_aumid);
 
                     let final_name = if ((is_browser_host
                         && (is_browser_pwa || window_aumid.is_none()))
