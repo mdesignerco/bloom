@@ -700,6 +700,74 @@ pub fn get_setting_str(_app: &tauri::AppHandle, key: &str) -> Option<String> {
     guard.get(key)?.as_str().map(|s| s.to_string())
 }
 
+/// Center point of the "active" target: the foreground window if it is a real
+/// (non-shell, visible) window, otherwise the cursor position. Used to decide
+/// which monitor the island should live on.
+fn win32_target_point() -> Option<(f64, f64)> {
+    unsafe {
+        use windows::Win32::Foundation::{POINT, RECT};
+        use windows::Win32::UI::WindowsAndMessaging::{
+            GetClassNameA, GetCursorPos, GetForegroundWindow, GetWindow, GetWindowRect,
+            GetWindowThreadProcessId, IsWindowVisible, GW_HWNDNEXT,
+        };
+
+        let mut hwnd = GetForegroundWindow();
+        let mut attempts = 0;
+        while !hwnd.is_invalid() && attempts < 12 {
+            let mut pid = 0u32;
+            GetWindowThreadProcessId(hwnd, Some(&mut pid));
+            let mut class_name = [0u8; 256];
+            let len = GetClassNameA(hwnd, &mut class_name);
+            let class_str = std::str::from_utf8(&class_name[..len as usize]).unwrap_or("");
+            if class_str == "Progman"
+                || class_str == "WorkerW"
+                || class_str == "Shell_TrayWnd"
+                || class_str == "Shell_SecondaryTrayWnd"
+                || !IsWindowVisible(hwnd).as_bool()
+            {
+                hwnd = GetWindow(hwnd, GW_HWNDNEXT).unwrap_or_default();
+                attempts += 1;
+                continue;
+            }
+            let mut r = RECT::default();
+            if GetWindowRect(hwnd, &mut r).is_ok() && r.right > r.left && r.bottom > r.top {
+                let cx = (r.left as f64 + r.right as f64) / 2.0;
+                let cy = (r.top as f64 + r.bottom as f64) / 2.0;
+                return Some((cx, cy));
+            }
+            break;
+        }
+        let mut pt = POINT::default();
+        if GetCursorPos(&mut pt).is_ok() {
+            return Some((pt.x as f64, pt.y as f64));
+        }
+        None
+    }
+}
+
+/// The monitor the island should follow: the one holding the foreground window
+/// (falling back to the cursor's monitor, then to the primary monitor).
+pub fn active_monitor(app: &tauri::AppHandle) -> Option<tauri::Monitor> {
+    let monitors = app.available_monitors().ok()?;
+    if monitors.is_empty() {
+        return app.primary_monitor().ok().flatten();
+    }
+    if let Some((cx, cy)) = win32_target_point() {
+        for m in &monitors {
+            let p = m.position();
+            let s = m.size();
+            if cx >= p.x as f64
+                && cx < (p.x as f64 + s.width as f64)
+                && cy >= p.y as f64
+                && cy < (p.y as f64 + s.height as f64)
+            {
+                return Some(m.clone());
+            }
+        }
+    }
+    monitors.into_iter().next()
+}
+
 /// Re-assert HWND_TOPMOST without activating the window.
 ///
 /// Tauri's `set_always_on_top(true)` calls `SetWindowPos(HWND_TOPMOST)` without

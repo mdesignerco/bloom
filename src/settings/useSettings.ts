@@ -76,6 +76,12 @@ export function useSettings() {
 		return raw === "auto-hide" ? "smart" : raw;
 	});
 	const [notchMode, setNotchMode] = useState("fixed");
+	const [overlayAlways, setOverlayAlways] = useState(
+		() => localStorage.getItem("bloom-overlay-always") === "true"
+	);
+	const [followActiveMonitor, setFollowActiveMonitor] = useState(
+		() => localStorage.getItem("bloom-follow-active-monitor") !== "false"
+	);
 	const [lowBatteryThreshold, setLowBatteryThreshold] = useState(20);
 	const [updateStatus, setUpdateStatus] = useState<
 		"idle" | "checking" | "available" | "uptodate" | "error" | "downloading" | "installing"
@@ -157,6 +163,8 @@ export function useSettings() {
 			apply(getVal("bloom-low-battery-threshold"), setLowBatteryThreshold, parseInt);
 
 			apply(getVal("bloom-notch-mode"), setNotchMode, (v) => (v === "auto-hide" ? "smart" : v));
+			apply(getVal("bloom-overlay-always"), setOverlayAlways, readBool);
+			apply(getVal("bloom-follow-active-monitor"), setFollowActiveMonitor, readBool);
 			apply(getVal("bloom-dock-mode"), setDockMode, (v) => (v === "auto-hide" ? "smart" : v));
 
 			const savedCity = getVal("bloom-weather-city");
@@ -201,6 +209,8 @@ export function useSettings() {
 	useSettingsSync({
 		"bloom-dock-mode": setDockMode,
 		"bloom-notch-mode": setNotchMode,
+		"bloom-overlay-always": setOverlayAlways,
+		"bloom-follow-active-monitor": setFollowActiveMonitor,
 		"bloom-dock-enabled": setDockEnabled,
 		"bloom-dock-icon-only": setDockIconOnly,
 		"bloom-dock-preview-enabled": setDockPreviewEnabled,
@@ -497,6 +507,20 @@ export function useSettings() {
 		saveSetting("bloom-notch-mode", newMode);
 	};
 
+	const toggleOverlayAlways = () => {
+		const next = !overlayAlways;
+		setOverlayAlways(next);
+		saveSetting("bloom-overlay-always", String(next));
+		invoke("set_feature_toggles", { overlayAlways: next }).catch(console.error);
+	};
+
+	const toggleFollowActiveMonitor = () => {
+		const next = !followActiveMonitor;
+		setFollowActiveMonitor(next);
+		saveSetting("bloom-follow-active-monitor", String(next));
+		invoke("set_feature_toggles", { followActiveMonitor: next }).catch(console.error);
+	};
+
 	const handleThresholdChange = (val: number) => {
 		setLowBatteryThreshold(val);
 		saveSetting("bloom-low-battery-threshold", val.toString());
@@ -683,6 +707,10 @@ export function useSettings() {
 		// Notch
 		notchMode,
 		setNotchModeValue,
+		overlayAlways,
+		toggleOverlayAlways,
+		followActiveMonitor,
+		toggleFollowActiveMonitor,
 		calendarEnabled,
 		toggleCalendar,
 		timerSoundEnabled,

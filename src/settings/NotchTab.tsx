@@ -8,7 +8,9 @@ import {
 	Sparkles,
 	Circle,
 	CloudSun,
-	X
+	X,
+	MonitorUp,
+	Maximize2
 } from "lucide-react";
 import { SettingRow } from "./SettingRow";
 import { StatusWidgetConfig } from "../components/StatusWidgetConfig";
@@ -17,6 +19,10 @@ import type { WidgetConfig } from "./types";
 interface NotchTabProps {
 	notchMode: string;
 	setNotchModeValue: (mode: string) => void;
+	overlayAlways: boolean;
+	toggleOverlayAlways: () => void;
+	followActiveMonitor: boolean;
+	toggleFollowActiveMonitor: () => void;
 	calendarEnabled: boolean;
 	toggleCalendar: () => void;
 	timerSoundEnabled: boolean;
@@ -54,6 +60,10 @@ interface NotchTabProps {
 export function NotchTab({
 	notchMode,
 	setNotchModeValue,
+	overlayAlways,
+	toggleOverlayAlways,
+	followActiveMonitor,
+	toggleFollowActiveMonitor,
 	calendarEnabled,
 	toggleCalendar,
 	timerSoundEnabled,
@@ -96,6 +106,32 @@ export function NotchTab({
 						<option value="smart">Smart</option>
 						<option value="peek">Peek</option>
 					</select>
+				</SettingRow>
+
+				<SettingRow
+					icon={MonitorUp}
+					label="Follow Active Monitor"
+					desc="Slide to the monitor of the window in focus"
+				>
+					<label className="toggle-switch">
+						<input
+							type="checkbox"
+							checked={followActiveMonitor}
+							onChange={toggleFollowActiveMonitor}
+						/>
+						<span className="slider"></span>
+					</label>
+				</SettingRow>
+
+				<SettingRow
+					icon={Maximize2}
+					label="Always Show Over Fullscreen"
+					desc="Keep the island interactive above fullscreen apps"
+				>
+					<label className="toggle-switch">
+						<input type="checkbox" checked={overlayAlways} onChange={toggleOverlayAlways} />
+						<span className="slider"></span>
+					</label>
 				</SettingRow>
 
 				<SettingRow icon={Calendar} label="Calendar & Timer" desc="Enable productivity split-view">

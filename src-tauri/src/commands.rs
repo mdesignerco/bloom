@@ -4,7 +4,8 @@ use windows::Win32::Foundation::{HWND, LPARAM};
 use windows::Win32::UI::WindowsAndMessaging::EnumWindows;
 
 use crate::services::{
-    enum_windows_proc, register_appbar, sync_overlays, unregister_appbar_native,
+    enum_windows_proc, position_main_window, register_appbar, sync_overlays,
+    unregister_appbar_native,
 };
 use crate::state::*;
 use crate::types::{AppInfo, BrightnessChangeEvent, IntRect};
@@ -103,16 +104,33 @@ pub async fn toggle_dock(app: AppHandle, enable: bool) {
 
 #[tauri::command]
 pub async fn sync_appbar(app: AppHandle) {
+    // Island-only: no ABE reservation. Position the island on the active
+    // monitor (overlay style) and keep it topmost.
+    position_main_window(&app, false);
     if let Some(main_win) = app.get_webview_window("main") {
-        if MAIN_APPBAR_REGISTERED.load(Ordering::Relaxed) {
-            register_appbar(main_win);
-        } else {
-            if let Ok(hwnd) = main_win.hwnd() {
-                re_assert_topmost(hwnd);
-            }
+        if let Ok(hwnd) = main_win.hwnd() {
+            re_assert_topmost(hwnd);
         }
     }
     sync_overlays(&app);
+}
+
+#[tauri::command]
+pub fn set_feature_toggles(
+    app: AppHandle,
+    overlay_always: Option<bool>,
+    follow_active_monitor: Option<bool>,
+) {
+    if let Some(v) = overlay_always {
+        OVERLAY_ALWAYS_ON.store(v, Ordering::Relaxed);
+    }
+    if let Some(v) = follow_active_monitor {
+        FOLLOW_ACTIVE_MONITOR.store(v, Ordering::Relaxed);
+        if v {
+            position_main_window(&app, false);
+            sync_overlays(&app);
+        }
+    }
 }
 
 #[tauri::command]
@@ -134,7 +152,11 @@ pub async fn change_dock_mode(app: AppHandle, mode: String) {
 pub async fn change_notch_mode(app: AppHandle, mode: String) {
     if let Some(main_win) = app.get_webview_window("main") {
         if mode == "fixed" {
-            register_appbar(main_win.clone());
+            // Island-only fixed mode = overlay: never reserve an ABE strip.
+            position_main_window(&app, false);
+            if let Ok(hwnd) = main_win.hwnd() {
+                re_assert_topmost(hwnd);
+            }
         } else {
             let _ = main_win.show();
             if let Ok(hwnd) = main_win.hwnd() {
@@ -155,16 +177,8 @@ pub async fn change_notch_mode(app: AppHandle, mode: String) {
                 });
             }
         }
-        // Reposition window to span the full primary monitor so CSS justify-content:center works
-        if let Ok(Some(monitor)) = main_win.primary_monitor() {
-            let m_pos = monitor.position();
-            let m_size = monitor.size();
-            let scale = monitor.scale_factor();
-            let bloom_scale = crate::utils::get_bloom_scale(&app);
-            let target_height = (420.0 * bloom_scale * scale) as u32;
-            let _ = main_win.set_position(tauri::PhysicalPosition::new(m_pos.x, m_pos.y));
-            let _ = main_win.set_size(tauri::PhysicalSize::new(m_size.width, target_height));
-        }
+        // Reposition window to span the active monitor so CSS justify-content:center works
+        position_main_window(&app, false);
 
         let current = CURRENT_NOTCH_OVERLAP.load(Ordering::Relaxed);
         if current != -1 {

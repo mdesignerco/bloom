@@ -1377,6 +1377,7 @@ pub fn setup_system_worker(app_handle: AppHandle) -> Sender<SystemCommand> {
         let mut last_notch_overlap: Option<bool> = None;
         let mut last_dock_maximized: Option<bool> = None;
         let mut last_fg_maximized = false;
+        let mut last_applied_monitor: Option<(i32, i32)> = None;
         let mut last_hwnd = HWND(std::ptr::null_mut());
         let mut last_emit = Instant::now();
         let mut is_known_shell = false;
@@ -1452,6 +1453,29 @@ pub fn setup_system_worker(app_handle: AppHandle) -> Sender<SystemCommand> {
                 // the user clicks maximize, so without this the adaptive dock
                 // would wait for the 3s fallback recompute to react.
                 let fg_is_maximized = !hwnd.is_invalid() && IsZoomed(hwnd).as_bool();
+
+                // Island-only monitor-follow: every ~400ms re-park the island (and
+                // the full-screen overlay) on the monitor holding the foreground
+                // window, falling back to the cursor's monitor. Slides when the
+                // target monitor actually changes.
+                if FOLLOW_ACTIVE_MONITOR.load(Ordering::Relaxed)
+                    && now_ms() - LAST_MONITOR_FOLLOW_MS.load(Ordering::Relaxed) >= 400
+                {
+                    LAST_MONITOR_FOLLOW_MS.store(now_ms(), Ordering::Relaxed);
+                    if let Some(m) = crate::utils::active_monitor(&handle_visibility) {
+                        let p = m.position();
+                        let origin = (p.x, p.y);
+                        if last_applied_monitor != Some(origin) {
+                            last_applied_monitor = Some(origin);
+                            let ah = handle_visibility.clone();
+                            std::thread::spawn(move || {
+                                std::thread::sleep(std::time::Duration::from_millis(40));
+                                position_main_window(&ah, true);
+                                sync_overlays(&ah);
+                            });
+                        }
+                    }
+                }
 
                 if !hwnd.is_invalid()
                     && (hwnd != last_hwnd
@@ -2078,11 +2102,12 @@ unsafe extern "system" fn mouse_hook_proc(
                 return CallNextHookEx(None, code, wparam, lparam);
             }
 
-            // Refresh cached monitor info every 1s
-            if now - MH_LAST_MONITOR_UPDATE_MS.load(Ordering::Relaxed) > 1000 {
-                if let Ok(Some(monitor)) = app_handle.primary_monitor() {
-                    let pos = *monitor.position();
-                    let size = *monitor.size();
+            // Refresh cached monitor info every 500ms, tracking the active monitor
+            // (foreground window, else cursor) so edge hit-boxes follow the island.
+            if now - MH_LAST_MONITOR_UPDATE_MS.load(Ordering::Relaxed) > 500 {
+                if let Some(monitor) = crate::utils::active_monitor(&app_handle) {
+                    let pos = monitor.position();
+                    let size = monitor.size();
                     *MH_CACHED_MON_POS.lock().unwrap() = Some((pos.x, pos.y));
                     *MH_CACHED_MON_SIZE.lock().unwrap() = Some((size.width, size.height));
                     MH_LAST_MONITOR_UPDATE_MS.store(now, Ordering::Relaxed);
@@ -2097,6 +2122,11 @@ unsafe extern "system" fn mouse_hook_proc(
             let mon_h = cached_size.1 as i32;
 
             let fg_fs = CURRENT_FOREGROUND_FULLSCREEN.load(Ordering::Relaxed);
+            // Island-only overlay mode: when `bloom-overlay-always` is on the
+            // island stays interactive above fullscreen apps instead of going
+            // click-through. The volume/brightness edge OSDs below remain gated
+            // by `!fg_fs` on purpose so they never pop up over a fullscreen app.
+            let interactive = !fg_fs || OVERLAY_ALWAYS_ON.load(Ordering::Relaxed);
 
             // --- Dock Interaction ---
             if fg_fs {
@@ -2235,7 +2265,7 @@ unsafe extern "system" fn mouse_hook_proc(
             }
 
             // --- Main (TopBar) Interaction ---
-            if !fg_fs {
+            if interactive {
                 if let Some(main_win) = app_handle.get_webview_window("main") {
                     if main_win.is_visible().unwrap_or(false) {
                         let in_notch_hover = NOTCH_IS_HOVERED.load(Ordering::Relaxed);
@@ -2708,10 +2738,10 @@ pub fn sync_overlays(app: &AppHandle) {
     if crate::state::OVERLAY_IN_SPLASH.load(Ordering::Relaxed) {
         return;
     }
-    // Full-screen overlay — notches render at left/right edges via CSS
-    // The window covers the entire primary monitor so it never needs repositioning
+    // Full-screen overlay — notches render at left/right edges via CSS.
+    // The window follows the active monitor along with the island.
     if let Some(ov_win) = app.get_webview_window("overlay") {
-        if let Ok(Some(monitor)) = ov_win.primary_monitor() {
+        if let Some(monitor) = crate::utils::active_monitor(app) {
             let size = monitor.size();
             let pos = monitor.position();
             let _ = ov_win.set_position(tauri::PhysicalPosition::new(pos.x, pos.y));
@@ -2723,104 +2753,85 @@ pub fn sync_overlays(app: &AppHandle) {
     }
 }
 
-pub fn register_appbar(window: tauri::WebviewWindow) {
-    if let Ok(Some(monitor)) = window.app_handle().primary_monitor() {
-        let m_size = monitor.size();
-        let m_pos = monitor.position();
-        let hwnd = window.hwnd().unwrap();
-        let scale = monitor.scale_factor();
-        let bloom_scale = crate::utils::get_bloom_scale(window.app_handle());
-        let ph = ((420.0 * bloom_scale) * scale) as i32;
-        let pr = ((40.0 * bloom_scale) * scale) as i32; // Scale the reserved top screen space
+/// Position the island (main window) to span the active monitor's full width and
+/// the notch height (420 CSS px × scale). When `animate` is true the window
+/// slides from its current position in small steps instead of jumping.
+pub fn position_main_window(app: &AppHandle, animate: bool) {
+    let Some(monitor) = crate::utils::active_monitor(app) else {
+        return;
+    };
+    let Some(main_win) = app.get_webview_window("main") else {
+        return;
+    };
+    let scale = monitor.scale_factor();
+    let bloom_scale = crate::utils::get_bloom_scale(app);
+    let ph = ((420.0 * bloom_scale) * scale) as u32;
+    let pos = monitor.position();
+    let size = monitor.size();
+    let target = (pos.x, pos.y, size.width, ph);
 
-        unsafe {
-            use windows::Win32::Foundation::RECT;
-            use windows::Win32::UI::Shell::{
-                SHAppBarMessage, ABE_TOP, ABM_NEW, ABM_QUERYPOS, ABM_SETPOS, APPBARDATA,
-            };
-            use windows::Win32::UI::WindowsAndMessaging::{
-                GetWindowLongPtrW, GetWindowRect, SetWindowLongPtrW, SetWindowPos, GWL_EXSTYLE,
-                SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOZORDER, WS_EX_NOACTIVATE as WS_EX_NA,
-                WS_EX_TOOLWINDOW,
-            };
-
-            // Set styles first
-            let mut ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as usize;
-            ex_style |= (WS_EX_TOOLWINDOW.0 | WS_EX_NA.0) as usize;
-            let _ = SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex_style as isize);
-
-            let mut abd = APPBARDATA {
-                cbSize: std::mem::size_of::<APPBARDATA>() as u32,
-                hWnd: hwnd,
-                ..Default::default()
-            };
-
-            if !MAIN_APPBAR_REGISTERED.load(Ordering::Relaxed) {
-                SHAppBarMessage(ABM_NEW, &mut abd);
-                MAIN_APPBAR_REGISTERED.store(true, Ordering::Relaxed);
-            }
-
-            abd.uEdge = ABE_TOP;
-            abd.rc = RECT {
-                left: m_pos.x,
-                top: m_pos.y,
-                right: m_pos.x + m_size.width as i32,
-                bottom: m_pos.y + pr,
-            };
-
-            SHAppBarMessage(ABM_QUERYPOS, &mut abd);
-            SHAppBarMessage(ABM_SETPOS, &mut abd);
-
-            // Use the shell-approved rect for the final position, but keep our ph height for the window
-            let final_width = abd.rc.right - abd.rc.left;
-
-            let mut current_rect = RECT::default();
-            let mut already_positioned = false;
-            if GetWindowRect(hwnd, &mut current_rect).is_ok() {
-                let current_width = current_rect.right - current_rect.left;
-                let current_height = current_rect.bottom - current_rect.top;
-                if current_rect.left == abd.rc.left
-                    && current_rect.top == abd.rc.top
-                    && current_width == final_width
-                    && current_height == ph
-                {
-                    already_positioned = true;
-                }
-            }
-
-            if !already_positioned {
-                let _ = SetWindowPos(
-                    hwnd,
-                    None,
-                    abd.rc.left,
-                    abd.rc.top,
-                    final_width,
-                    ph,
-                    SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
-                );
-            }
-
-            // Re-assert topmost after repositioning — use re_assert_topmost instead of
-            // set_always_on_top(true) to include SWP_NOACTIVATE and re-stamp WS_EX_NOACTIVATE.
-            // This prevents WM_ACTIVATE from reaching WebView2, which caused bloom windows
-            // to blank/hide when other windows were minimized or closed.
-            re_assert_topmost(hwnd);
-
-            if !window.is_visible().unwrap_or(false) {
-                let _ = window.show();
-            }
-        }
+    if animate {
+        slide_window_to(&main_win, target);
     } else {
-        let w = window.clone();
-        tauri::async_runtime::spawn(async move {
-            for _ in 0..10 {
-                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                if let Ok(Some(_monitor)) = w.app_handle().primary_monitor() {
-                    register_appbar(w);
-                    break;
-                }
+        let _ = main_win.set_position(tauri::PhysicalPosition::new(pos.x, pos.y));
+        let _ = main_win.set_size(tauri::PhysicalSize::new(size.width, ph));
+    }
+}
+
+/// Slide the island between monitors with an ease-out run (12 steps × ~25 ms).
+/// Only the position is eased; the final size snaps in on the last step so the
+/// window never looks squished while travelling between differently scaled
+/// monitors.
+fn slide_window_to(win: &tauri::WebviewWindow, target: (i32, i32, u32, u32)) {
+    let Ok(from_pos) = win.outer_position() else {
+        let (x, y, w, h) = target;
+        let _ = win.set_position(tauri::PhysicalPosition::new(x, y));
+        let _ = win.set_size(tauri::PhysicalSize::new(w, h));
+        return;
+    };
+    let (fx, fy) = (from_pos.x as f64, from_pos.y as f64);
+    let (tx, ty, tw, th) = target;
+    if (fx - tx as f64).abs() < 1.0 && (fy - ty as f64).abs() < 1.0 {
+        let _ = win.set_position(tauri::PhysicalPosition::new(tx, ty));
+        let _ = win.set_size(tauri::PhysicalSize::new(tw, th));
+        return;
+    }
+    let win2 = win.clone();
+    tauri::async_runtime::spawn(async move {
+        const STEPS: usize = 12;
+        for i in 1..=STEPS {
+            let t = i as f64 / STEPS as f64;
+            let eased = 1.0 - (1.0 - t) * (1.0 - t); // ease-out
+            let x = (fx + (tx as f64 - fx) * eased).round() as i32;
+            let y = (fy + (ty as f64 - fy) * eased).round() as i32;
+            let _ = win2.set_position(tauri::PhysicalPosition::new(x, y));
+            if i == STEPS {
+                let _ = win2.set_size(tauri::PhysicalSize::new(tw, th));
             }
-        });
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    });
+}
+
+pub fn register_appbar(window: tauri::WebviewWindow) {
+    // Island-only build: the ABE_TOP appbar (which reserved a ~40 CSS px strip
+    // and pushed maximized windows down) is intentionally gone. The island
+    // merely floats on top of the active monitor without reserving screen
+    // space, so maximized windows use their full bounds.
+    let app = window.app_handle().clone();
+    if let Ok(hwnd) = window.hwnd() {
+        // Clear any ABE reservation left over from a pre-island build.
+        unregister_appbar_native(hwnd);
+    }
+    MAIN_APPBAR_REGISTERED.store(false, Ordering::Relaxed);
+
+    position_main_window(&app, false);
+
+    if let Ok(hwnd) = window.hwnd() {
+        re_assert_topmost(hwnd);
+    }
+    if !window.is_visible().unwrap_or(false) {
+        let _ = window.show();
     }
 }
 

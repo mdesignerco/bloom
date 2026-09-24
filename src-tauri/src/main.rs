@@ -111,6 +111,7 @@ fn main() {
             change_dock_mode,
             change_notch_mode,
             sync_appbar,
+            set_feature_toggles,
             open_app,
             launch_new_instance,
             update_dock_rect,
@@ -255,6 +256,23 @@ fn main() {
             setup_audio_visualization(app.handle().clone());
             crate::utils::init_settings_cache(app.handle());
             setup_settings_watcher(app.handle().clone());
+
+            // Mirror the island-only feature toggles into their atomics so the
+            // mouse hook and monitor-follow behave correctly before the settings
+            // window ever opens.
+            {
+                let app_h = app.handle().clone();
+                OVERLAY_ALWAYS_ON.store(
+                    crate::utils::get_setting_str(&app_h, "bloom-overlay-always")
+                        .is_some_and(|v| v == "true"),
+                    Ordering::Relaxed,
+                );
+                FOLLOW_ACTIVE_MONITOR.store(
+                    crate::utils::get_setting_str(&app_h, "bloom-follow-active-monitor")
+                        .is_none_or(|v| v != "false"),
+                    Ordering::Relaxed,
+                );
+            }
 
             // Listen for second-instance signal to open settings
             if let Some(&h_event) = SINGLE_INSTANCE_EVENT_HANDLE.get() {

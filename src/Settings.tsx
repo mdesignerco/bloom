@@ -129,6 +129,10 @@ function SettingsApp() {
 						<NotchTab
 							notchMode={settings.notchMode}
 							setNotchModeValue={settings.setNotchModeValue}
+							overlayAlways={settings.overlayAlways}
+							toggleOverlayAlways={settings.toggleOverlayAlways}
+							followActiveMonitor={settings.followActiveMonitor}
+							toggleFollowActiveMonitor={settings.toggleFollowActiveMonitor}
 							calendarEnabled={settings.calendarEnabled}
 							toggleCalendar={settings.toggleCalendar}
 							timerSoundEnabled={settings.timerSoundEnabled}

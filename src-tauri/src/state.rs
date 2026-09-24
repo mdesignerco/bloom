@@ -35,6 +35,15 @@ pub static OVERLAY_IN_SPLASH: AtomicBool = AtomicBool::new(false);
 pub static CURRENT_FOREGROUND_FULLSCREEN: AtomicBool = AtomicBool::new(false);
 pub static CURRENT_FOREGROUND_MAXIMIZED: AtomicBool = AtomicBool::new(false);
 
+/// Island-only feature toggles (mirrored from `bloom-overlay-always` /
+/// `bloom-follow-active-monitor` settings). When OVERLAY_ALWAYS_ON is set the
+/// notch stays interactive over fullscreen apps; when FOLLOW_ACTIVE_MONITOR is
+/// set the island + overlay track the foreground window's monitor.
+pub static OVERLAY_ALWAYS_ON: AtomicBool = AtomicBool::new(false);
+pub static FOLLOW_ACTIVE_MONITOR: AtomicBool = AtomicBool::new(true);
+/// Debounce guard so the monitor-follow reposition doesn't spam SetWindowPos.
+pub static LAST_MONITOR_FOLLOW_MS: AtomicI64 = AtomicI64::new(0);
+
 pub static SINGLE_INSTANCE_MUTEX_HANDLE: OnceLock<isize> = OnceLock::new();
 pub static SINGLE_INSTANCE_EVENT_HANDLE: OnceLock<isize> = OnceLock::new();
 
