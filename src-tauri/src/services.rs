@@ -7,15 +7,16 @@ use std::sync::{
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager};
 use windows::core::BOOL;
-use windows::Win32::Foundation::CloseHandle;
+use windows::Win32::Foundation::{CloseHandle, COLORREF};
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS};
 use windows::Win32::System::Threading::{
     OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, GetWindowLongW, GetWindowThreadProcessId, IsWindowVisible, SetWindowsHookExW,
-    GWL_EXSTYLE, MSLLHOOKSTRUCT, WH_MOUSE_LL, WM_MOUSEMOVE, WS_EX_TOOLWINDOW,
+    CallNextHookEx, GetWindowLongPtrW, GetWindowLongW, GetWindowThreadProcessId, IsWindowVisible,
+    SetLayeredWindowAttributes, SetWindowLongPtrW, SetWindowsHookExW, GWL_EXSTYLE, LWA_ALPHA,
+    MSLLHOOKSTRUCT, WH_MOUSE_LL, WM_MOUSEMOVE, WS_EX_LAYERED, WS_EX_TOOLWINDOW,
 };
 use wmi::{COMLibrary, WMIConnection};
 
@@ -2806,13 +2807,41 @@ fn place_island(main_win: &tauri::WebviewWindow, monitor: &tauri::Monitor, anima
     if animate {
         animate_island_to_monitor(main_win, target);
     } else {
+        // Restore opacity in case an interrupted cross-monitor animation left
+        // the window transparent.
+        if let Ok(hwnd) = main_win.hwnd() {
+            set_window_opacity(hwnd, 1.0);
+        }
         let _ = main_win.set_position(tauri::PhysicalPosition::new(pos.x, pos.y));
         let _ = main_win.set_size(tauri::PhysicalSize::new(size.width, ph));
     }
 }
 
-/// Slide `win` from (fx, fy) to (tx, ty) in small ease-out steps (~20 ms each).
-fn animate_xy(win: &tauri::WebviewWindow, fx: i32, fy: i32, tx: i32, ty: i32) {
+/// Set a window's top-level opacity via the layered-window attribute. Tauri
+/// v2.11 does not expose an opacity setter, so it is done directly with Win32;
+/// the layered style is added on demand and keeps WS_EX_TOOLWINDOW/topmost.
+fn set_window_opacity(hwnd: HWND, opacity: f64) {
+    let alpha = (opacity.clamp(0.0, 1.0) * 255.0).round() as u8;
+    let ex_style = unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) };
+    if ex_style & WS_EX_LAYERED.0 as isize == 0 {
+        unsafe {
+            SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex_style | WS_EX_LAYERED.0 as isize);
+        }
+    }
+    let _ = unsafe { SetLayeredWindowAttributes(hwnd, COLORREF(0), alpha, LWA_ALPHA) };
+}
+
+/// Slide `win` from (fx, fy) to (tx, ty) in small ease-out steps (~20 ms each),
+/// cross-fading the whole window between `fade_from` and `fade_to` opacity.
+fn animate_xy(
+    win: &tauri::WebviewWindow,
+    fx: i32,
+    fy: i32,
+    tx: i32,
+    ty: i32,
+    fade_from: f64,
+    fade_to: f64,
+) {
     let win2 = win.clone();
     tauri::async_runtime::spawn(async move {
         const STEPS: usize = 10;
@@ -2821,38 +2850,49 @@ fn animate_xy(win: &tauri::WebviewWindow, fx: i32, fy: i32, tx: i32, ty: i32) {
             let eased = 1.0 - (1.0 - t) * (1.0 - t); // ease-out
             let x = (fx as f64 + (tx as f64 - fx as f64) * eased).round() as i32;
             let y = (fy as f64 + (ty as f64 - fy as f64) * eased).round() as i32;
+            let op = fade_from + (fade_to - fade_from) * eased;
             let _ = win2.set_position(tauri::PhysicalPosition::new(x, y));
+            if let Ok(hwnd) = win2.hwnd() {
+                set_window_opacity(hwnd, op);
+            }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
     });
 }
 
-/// Cross-monitor move: slide up off the current monitor, snap (hidden) above the
-/// target monitor and slide down into place on it.
+/// Cross-monitor move: slide up off the current monitor fading out, snap
+/// (invisible) above the target monitor and slide down into place fading in.
 fn animate_island_to_monitor(win: &tauri::WebviewWindow, target: (i32, i32, u32, u32)) {
     let Ok(from_pos) = win.outer_position() else {
         let (x, y, w, h) = target;
+        if let Ok(hwnd) = win.hwnd() {
+            set_window_opacity(hwnd, 1.0);
+        }
         let _ = win.set_position(tauri::PhysicalPosition::new(x, y));
         let _ = win.set_size(tauri::PhysicalSize::new(w, h));
         return;
     };
     let (tx, ty, tw, th) = target;
     if (from_pos.x - tx).abs() < 1 && (from_pos.y - ty).abs() < 1 {
+        if let Ok(hwnd) = win.hwnd() {
+            set_window_opacity(hwnd, 1.0);
+        }
         let _ = win.set_position(tauri::PhysicalPosition::new(tx, ty));
         let _ = win.set_size(tauri::PhysicalSize::new(tw, th));
         return;
     }
-    // Slide up out of view on the old monitor.
+    // Slide up out of view on the old monitor, fading out as it goes.
     let above_old_y = from_pos.y - th as i32;
-    animate_xy(win, from_pos.x, from_pos.y, from_pos.x, above_old_y);
+    animate_xy(win, from_pos.x, from_pos.y, from_pos.x, above_old_y, 1.0, 0.0);
     let win2 = win.clone();
     tauri::async_runtime::spawn(async move {
         // Let the exit run finish before touching the window.
         tokio::time::sleep(std::time::Duration::from_millis(240)).await;
-        // Snap out of view just above the new monitor and slide down into place.
+        // Snap out of view just above the new monitor and slide down into place,
+        // fading back in.
         let _ = win2.set_position(tauri::PhysicalPosition::new(tx, ty - th as i32));
         let _ = win2.set_size(tauri::PhysicalSize::new(tw, th));
-        animate_xy(&win2, tx, ty - th as i32, tx, ty);
+        animate_xy(&win2, tx, ty - th as i32, tx, ty, 0.0, 1.0);
     });
 }
 
