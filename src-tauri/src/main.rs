@@ -205,11 +205,9 @@ fn main() {
                 }
                 tauri::WindowEvent::ScaleFactorChanged { .. } => {
                     let w = win_for_events.clone();
-                    let h = handle_for_events.clone();
                     tauri::async_runtime::spawn(async move {
                         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                         register_appbar(w);
-                        sync_overlays(&h);
                     });
                 }
                 tauri::WindowEvent::CloseRequested { api, .. } => {

@@ -4,8 +4,7 @@ use windows::Win32::Foundation::{HWND, LPARAM};
 use windows::Win32::UI::WindowsAndMessaging::EnumWindows;
 
 use crate::services::{
-    enum_windows_proc, position_main_window, register_appbar, sync_overlays,
-    unregister_appbar_native,
+    enum_windows_proc, register_appbar, reposition_island_and_overlays, unregister_appbar_native,
 };
 use crate::state::*;
 use crate::types::{AppInfo, BrightnessChangeEvent, IntRect};
@@ -104,15 +103,9 @@ pub async fn toggle_dock(app: AppHandle, enable: bool) {
 
 #[tauri::command]
 pub async fn sync_appbar(app: AppHandle) {
-    // Island-only: no ABE reservation. Position the island on the active
-    // monitor (overlay style) and keep it topmost.
-    position_main_window(&app, false);
-    if let Some(main_win) = app.get_webview_window("main") {
-        if let Ok(hwnd) = main_win.hwnd() {
-            re_assert_topmost(hwnd);
-        }
-    }
-    sync_overlays(&app);
+    // Island-only: no ABE reservation. Position the island and overlay on the
+    // active monitor (overlay style) and keep them topmost.
+    reposition_island_and_overlays(&app, false);
 }
 
 #[tauri::command]
@@ -127,8 +120,7 @@ pub fn set_feature_toggles(
     if let Some(v) = follow_active_monitor {
         FOLLOW_ACTIVE_MONITOR.store(v, Ordering::Relaxed);
         if v {
-            position_main_window(&app, false);
-            sync_overlays(&app);
+            reposition_island_and_overlays(&app, false);
         }
     }
 }
@@ -151,13 +143,9 @@ pub async fn change_dock_mode(app: AppHandle, mode: String) {
 #[tauri::command]
 pub async fn change_notch_mode(app: AppHandle, mode: String) {
     if let Some(main_win) = app.get_webview_window("main") {
-        if mode == "fixed" {
-            // Island-only fixed mode = overlay: never reserve an ABE strip.
-            position_main_window(&app, false);
-            if let Ok(hwnd) = main_win.hwnd() {
-                re_assert_topmost(hwnd);
-            }
-        } else {
+        if mode != "fixed" {
+            // Island-only fixed mode = overlay: never reserve an ABE strip, but
+            // the smart/peek modes still release any leftover reservation.
             let _ = main_win.show();
             if let Ok(hwnd) = main_win.hwnd() {
                 let hwnd_val = hwnd.0 as isize;
@@ -177,8 +165,9 @@ pub async fn change_notch_mode(app: AppHandle, mode: String) {
                 });
             }
         }
-        // Reposition window to span the active monitor so CSS justify-content:center works
-        position_main_window(&app, false);
+        // Reposition island + overlay on the active monitor so CSS
+        // justify-content:center works.
+        reposition_island_and_overlays(&app, false);
 
         let current = CURRENT_NOTCH_OVERLAP.load(Ordering::Relaxed);
         if current != -1 {

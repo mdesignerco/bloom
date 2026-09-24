@@ -1470,8 +1470,7 @@ pub fn setup_system_worker(app_handle: AppHandle) -> Sender<SystemCommand> {
                             let ah = handle_visibility.clone();
                             std::thread::spawn(move || {
                                 std::thread::sleep(std::time::Duration::from_millis(40));
-                                position_main_window(&ah, true);
-                                sync_overlays(&ah);
+                                reposition_island_and_overlays(&ah, true);
                             });
                         }
                     }
@@ -2742,10 +2741,7 @@ pub fn sync_overlays(app: &AppHandle) {
     // The window follows the active monitor along with the island.
     if let Some(ov_win) = app.get_webview_window("overlay") {
         if let Some(monitor) = crate::utils::active_monitor(app) {
-            let size = monitor.size();
-            let pos = monitor.position();
-            let _ = ov_win.set_position(tauri::PhysicalPosition::new(pos.x, pos.y));
-            let _ = ov_win.set_size(tauri::PhysicalSize::new(size.width, size.height));
+            place_overlay(&ov_win, &monitor);
         }
         if let Ok(hwnd) = ov_win.hwnd() {
             re_assert_topmost(hwnd);
@@ -2753,71 +2749,110 @@ pub fn sync_overlays(app: &AppHandle) {
     }
 }
 
-/// Position the island (main window) to span the active monitor's full width and
-/// the notch height (420 CSS px × scale). When `animate` is true the window
-/// slides from its current position in small steps instead of jumping.
-pub fn position_main_window(app: &AppHandle, animate: bool) {
+/// Position the full-screen overlay window onto the given monitor.
+fn place_overlay(ov_win: &tauri::WebviewWindow, monitor: &tauri::Monitor) {
+    let size = monitor.size();
+    let pos = monitor.position();
+    let _ = ov_win.set_position(tauri::PhysicalPosition::new(pos.x, pos.y));
+    let _ = ov_win.set_size(tauri::PhysicalSize::new(size.width, size.height));
+}
+
+/// Re-park the island and the full-screen overlay on the active monitor using a
+/// single monitor lookup. This is the choke point for every repositioning path
+/// (startup, sync, mode change, monitor-follow, scale change).
+///
+/// When `animate` is true and the target monitor differs from the current one
+/// the island slides up out of view on the old monitor, snaps invisibly above
+/// the new monitor and slides down into place — subtle, never dragging across
+/// the screen.
+pub fn reposition_island_and_overlays(app: &AppHandle, animate: bool) {
     let Some(monitor) = crate::utils::active_monitor(app) else {
         return;
     };
-    let Some(main_win) = app.get_webview_window("main") else {
-        return;
-    };
+    if let Some(main_win) = app.get_webview_window("main") {
+        place_island(&main_win, &monitor, animate);
+        if let Ok(hwnd) = main_win.hwnd() {
+            re_assert_topmost(hwnd);
+        }
+    }
+    if !crate::state::OVERLAY_IN_SPLASH.load(Ordering::Relaxed) {
+        if let Some(ov_win) = app.get_webview_window("overlay") {
+            place_overlay(&ov_win, &monitor);
+            if let Ok(hwnd) = ov_win.hwnd() {
+                re_assert_topmost(hwnd);
+            }
+        }
+    }
+}
+
+/// Position the island (main window) to span the monitor's full width and the
+/// notch height (420 CSS px × scale). The window is shown before placing: it
+/// starts hidden (visible:false) and this is the single placement choke point
+/// for all fixed-mode paths (startup, sync_appbar, mode change, monitor-follow),
+/// so without the show it would only reappear after a smart/fixed toggle.
+fn place_island(main_win: &tauri::WebviewWindow, monitor: &tauri::Monitor, animate: bool) {
     let scale = monitor.scale_factor();
+    let app = main_win.app_handle();
     let bloom_scale = crate::utils::get_bloom_scale(app);
     let ph = ((420.0 * bloom_scale) * scale) as u32;
     let pos = monitor.position();
     let size = monitor.size();
     let target = (pos.x, pos.y, size.width, ph);
 
-    // Fixed/overlay mode must make the island visible: the main window starts
-    // hidden (visible:false) and position_main_window is the single choke point
-    // for all fixed-mode placement paths (startup, sync_appbar, mode change,
-    // monitor-follow). Without this it only reappears after a smart/fixed toggle.
     if !main_win.is_visible().unwrap_or(false) {
         let _ = main_win.show();
     }
 
     if animate {
-        slide_window_to(&main_win, target);
+        animate_island_to_monitor(main_win, target);
     } else {
         let _ = main_win.set_position(tauri::PhysicalPosition::new(pos.x, pos.y));
         let _ = main_win.set_size(tauri::PhysicalSize::new(size.width, ph));
     }
 }
 
-/// Slide the island between monitors with an ease-out run (12 steps × ~25 ms).
-/// Only the position is eased; the final size snaps in on the last step so the
-/// window never looks squished while travelling between differently scaled
-/// monitors.
-fn slide_window_to(win: &tauri::WebviewWindow, target: (i32, i32, u32, u32)) {
+/// Slide `win` from (fx, fy) to (tx, ty) in small ease-out steps (~20 ms each).
+fn animate_xy(win: &tauri::WebviewWindow, fx: i32, fy: i32, tx: i32, ty: i32) {
+    let win2 = win.clone();
+    tauri::async_runtime::spawn(async move {
+        const STEPS: usize = 10;
+        for i in 1..=STEPS {
+            let t = i as f64 / STEPS as f64;
+            let eased = 1.0 - (1.0 - t) * (1.0 - t); // ease-out
+            let x = (fx as f64 + (tx as f64 - fx as f64) * eased).round() as i32;
+            let y = (fy as f64 + (ty as f64 - fy as f64) * eased).round() as i32;
+            let _ = win2.set_position(tauri::PhysicalPosition::new(x, y));
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    });
+}
+
+/// Cross-monitor move: slide up off the current monitor, snap (hidden) above the
+/// target monitor and slide down into place on it.
+fn animate_island_to_monitor(win: &tauri::WebviewWindow, target: (i32, i32, u32, u32)) {
     let Ok(from_pos) = win.outer_position() else {
         let (x, y, w, h) = target;
         let _ = win.set_position(tauri::PhysicalPosition::new(x, y));
         let _ = win.set_size(tauri::PhysicalSize::new(w, h));
         return;
     };
-    let (fx, fy) = (from_pos.x as f64, from_pos.y as f64);
     let (tx, ty, tw, th) = target;
-    if (fx - tx as f64).abs() < 1.0 && (fy - ty as f64).abs() < 1.0 {
+    if (from_pos.x - tx).abs() < 1 && (from_pos.y - ty).abs() < 1 {
         let _ = win.set_position(tauri::PhysicalPosition::new(tx, ty));
         let _ = win.set_size(tauri::PhysicalSize::new(tw, th));
         return;
     }
+    // Slide up out of view on the old monitor.
+    let above_old_y = from_pos.y - th as i32;
+    animate_xy(win, from_pos.x, from_pos.y, from_pos.x, above_old_y);
     let win2 = win.clone();
     tauri::async_runtime::spawn(async move {
-        const STEPS: usize = 12;
-        for i in 1..=STEPS {
-            let t = i as f64 / STEPS as f64;
-            let eased = 1.0 - (1.0 - t) * (1.0 - t); // ease-out
-            let x = (fx + (tx as f64 - fx) * eased).round() as i32;
-            let y = (fy + (ty as f64 - fy) * eased).round() as i32;
-            let _ = win2.set_position(tauri::PhysicalPosition::new(x, y));
-            if i == STEPS {
-                let _ = win2.set_size(tauri::PhysicalSize::new(tw, th));
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-        }
+        // Let the exit run finish before touching the window.
+        tokio::time::sleep(std::time::Duration::from_millis(240)).await;
+        // Snap out of view just above the new monitor and slide down into place.
+        let _ = win2.set_position(tauri::PhysicalPosition::new(tx, ty - th as i32));
+        let _ = win2.set_size(tauri::PhysicalSize::new(tw, th));
+        animate_xy(&win2, tx, ty - th as i32, tx, ty);
     });
 }
 
@@ -2833,14 +2868,7 @@ pub fn register_appbar(window: tauri::WebviewWindow) {
     }
     MAIN_APPBAR_REGISTERED.store(false, Ordering::Relaxed);
 
-    position_main_window(&app, false);
-
-    if let Ok(hwnd) = window.hwnd() {
-        re_assert_topmost(hwnd);
-    }
-    if !window.is_visible().unwrap_or(false) {
-        let _ = window.show();
-    }
+    reposition_island_and_overlays(&app, false);
 }
 
 pub fn register_dock_appbar(window: tauri::WebviewWindow) {
