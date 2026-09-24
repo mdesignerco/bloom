@@ -1,6 +1,7 @@
 use base64::{engine::general_purpose, Engine as _};
 use std::path::PathBuf;
 use std::sync::OnceLock;
+use std::time::Instant;
 use tauri::Manager;
 use windows::core::Interface;
 use windows::Win32::Foundation::{HGLOBAL, HWND};
@@ -649,11 +650,15 @@ unsafe fn wic_bitmap_to_base64(
     Some(format!("data:image/png;base64,{}", base64_str))
 }
 
+/// Monotonic millisecond clock for elapsed-time measurements (differences
+/// between two reads within the process). Uses `Instant` instead of
+/// `SystemTime`: it is immune to wall-clock changes (NTP resync, manual
+/// adjustment), needs no epoch handling, and is cheaper on Windows. The
+/// reference point is the first call.
 pub fn get_now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as i64
+    static REFERENCE: OnceLock<Instant> = OnceLock::new();
+    let origin = REFERENCE.get_or_init(Instant::now);
+    origin.elapsed().as_millis() as i64
 }
 
 /// Load settings.json into the in-memory cache. Call once at startup.

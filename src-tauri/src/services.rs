@@ -4,7 +4,7 @@ use std::sync::{
     atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU8, Ordering},
     Mutex, OnceLock,
 };
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager};
 use windows::core::BOOL;
 use windows::Win32::Foundation::{CloseHandle, COLORREF};
@@ -1460,9 +1460,9 @@ pub fn setup_system_worker(app_handle: AppHandle) -> Sender<SystemCommand> {
                 // window, falling back to the cursor's monitor. Slides when the
                 // target monitor actually changes.
                 if FOLLOW_ACTIVE_MONITOR.load(Ordering::Relaxed)
-                    && now_ms() - LAST_MONITOR_FOLLOW_MS.load(Ordering::Relaxed) >= 400
+                    && get_now_ms() - LAST_MONITOR_FOLLOW_MS.load(Ordering::Relaxed) >= 400
                 {
-                    LAST_MONITOR_FOLLOW_MS.store(now_ms(), Ordering::Relaxed);
+                    LAST_MONITOR_FOLLOW_MS.store(get_now_ms(), Ordering::Relaxed);
                     if let Some(m) = crate::utils::active_monitor(&handle_visibility) {
                         let p = m.position();
                         let origin = (p.x, p.y);
@@ -1720,7 +1720,7 @@ pub fn setup_system_worker(app_handle: AppHandle) -> Sender<SystemCommand> {
             // recheck flag on top-level window show/hide/destroy and foreground
             // changes, so the scan below only runs when something changed
             // (throttled to coalesce bursts of window events).
-            let scan_now = now_ms();
+            let scan_now = get_now_ms();
             if CAPTURE_RECHECK.load(Ordering::Relaxed)
                 && scan_now - CAPTURE_LAST_SCAN_MS.load(Ordering::Relaxed) >= 400
             {
@@ -1942,13 +1942,6 @@ static CAPTURE_UI_ACTIVE: AtomicBool = AtomicBool::new(false);
 static CAPTURE_RECHECK: AtomicBool = AtomicBool::new(true);
 static CAPTURE_LAST_SCAN_MS: AtomicI64 = AtomicI64::new(0);
 
-fn now_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as i64
-}
-
 /// True while a screen-capture UI (Windows Snipping Tool) has a visible window.
 /// Bloom's notch sits exactly where that toolbar lives, so it must get out of
 /// the way even if the capture window isn't recognised as fullscreen.
@@ -2061,7 +2054,7 @@ unsafe extern "system" fn mouse_hook_proc(
         // Throttle to ~30fps (32ms) to match old polling cadence.
         // Without this, state checks and set_ignore_cursor_events fire on
         // every pixel of cursor movement, causing notch flicker at edges.
-        let now = now_ms();
+        let now = get_now_ms();
         let last = MH_LAST_PROCESS_MS.load(Ordering::Relaxed);
         if now - last < 32 {
             return CallNextHookEx(None, code, wparam, lparam);
